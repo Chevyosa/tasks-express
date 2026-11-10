@@ -1,99 +1,121 @@
 const service = require('../services/taskService');
-const statuses = ['pending', 'in_progress', 'completed'];
-const priorities = ['low', 'medium', 'high'];
+const HttpError = require('../utils/httpError');
+const {
+  STATUSES,
+  PRIORITIES,
+  positiveInt,
+  validDate,
+  requireObjectBody,
+} = require('../utils/validators');
 
-class HttpError extends Error {
-  constructor(status, code, message) { super(message); this.status = status; this.code = code; }
-}
+const MAX_LIMIT = 100;
+const DEFAULT_LIMIT = 20;
+const MAX_QUERY_LENGTH = 100;
 
-function positiveInt(value, name) {
-  if (!/^\d+$/.test(String(value)) || Number(value) < 1 || !Number.isSafeInteger(Number(value))) {
-    throw new HttpError(400, 'INVALID_PARAMETER', `${name} harus berupa bilangan bulat positif.`);
-  }
-  return Number(value);
-}
-
-function validDate(value, name, nullable = true) {
-  if (value === null && nullable) return null;
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2}))?$/.test(value) || Number.isNaN(Date.parse(value))) {
-    throw new HttpError(400, 'INVALID_DATE', `${name} harus tanggal ISO 8601 yang valid.`);
-  }
-  return new Date(value.length === 10 ? `${value}T00:00:00Z` : value).toISOString().slice(0, 19).replace('T', ' ');
-}
+const notFound = () => new HttpError(404, 'TASK_NOT_FOUND', 'Tugas tidak ditemukan.');
 
 function validateTask(body, partial = false) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'INVALID_BODY', 'Body harus berupa objek JSON.');
+  requireObjectBody(body);
   const result = {};
+
   if (!partial || Object.hasOwn(body, 'title')) {
-    if (typeof body.title !== 'string' || !body.title.trim() || body.title.trim().length > 200) throw new HttpError(400, 'INVALID_TITLE', 'title wajib berupa teks 1–200 karakter.');
-    result.title = body.title.trim();
-  }
-  for (const key of ['description', 'due_at', 'priority', 'status']) {
-    if (!Object.hasOwn(body, key)) continue;
-    if (key === 'description') {
-      if (body[key] !== null && typeof body[key] !== 'string') throw new HttpError(400, 'INVALID_DESCRIPTION', 'description harus teks atau null.');
-      result[key] = body[key];
-    } else if (key === 'due_at') {
-      result[key] = validDate(body[key], key);
-    } else if (key === 'priority') {
-      if (!priorities.includes(body[key])) throw new HttpError(400, 'INVALID_PRIORITY', `priority harus salah satu: ${priorities.join(', ')}.`);
-      result[key] = body[key];
-    } else {
-      if (!statuses.includes(body[key])) throw new HttpError(400, 'INVALID_STATUS', `status harus salah satu: ${statuses.join(', ')}.`);
-      result[key] = body[key];
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    if (!title || title.length > 200) {
+      throw new HttpError(400, 'INVALID_TITLE', 'title wajib berupa teks 1–200 karakter.');
     }
+    result.title = title;
   }
-  if (partial && Object.hasOwn(result, 'status')) delete result.status;
-  if (partial && !Object.keys(result).length) throw new HttpError(400, 'EMPTY_UPDATE', 'Tidak ada field yang dapat diperbarui.');
+
+  if (Object.hasOwn(body, 'description')) {
+    if (body.description !== null && typeof body.description !== 'string') {
+      throw new HttpError(400, 'INVALID_DESCRIPTION', 'description harus teks atau null.');
+    }
+    result.description = body.description;
+  }
+
+  if (Object.hasOwn(body, 'due_at')) result.due_at = validDate(body.due_at, 'due_at');
+
+  if (Object.hasOwn(body, 'priority')) {
+    if (!PRIORITIES.includes(body.priority)) {
+      throw new HttpError(400, 'INVALID_PRIORITY', `priority harus salah satu: ${PRIORITIES.join(', ')}.`);
+    }
+    result.priority = body.priority;
+  }
+
+  if (partial && !Object.keys(result).length) {
+    throw new HttpError(400, 'EMPTY_UPDATE', 'Tidak ada field yang dapat diperbarui.');
+  }
   return result;
 }
 
+function parseListQuery(query) {
+  const { status, priority, q } = query;
+  if (status !== undefined && !STATUSES.includes(status)) {
+    throw new HttpError(400, 'INVALID_STATUS', `Filter status harus salah satu: ${STATUSES.join(', ')}.`);
+  }
+  if (priority !== undefined && !PRIORITIES.includes(priority)) {
+    throw new HttpError(400, 'INVALID_PRIORITY', `Filter priority harus salah satu: ${PRIORITIES.join(', ')}.`);
+  }
+  if (q !== undefined && (typeof q !== 'string' || q.length > MAX_QUERY_LENGTH)) {
+    throw new HttpError(400, 'INVALID_QUERY', `q harus teks maksimal ${MAX_QUERY_LENGTH} karakter.`);
+  }
+
+  const page = query.page === undefined ? 1 : positiveInt(query.page, 'page');
+  const limit = query.limit === undefined ? DEFAULT_LIMIT : positiveInt(query.limit, 'limit');
+  if (limit > MAX_LIMIT) throw new HttpError(400, 'INVALID_LIMIT', `limit maksimal ${MAX_LIMIT}.`);
+
+  const due_after = query.due_after === undefined
+    ? undefined
+    : validDate(query.due_after, 'due_after', { nullable: false });
+  const due_before = query.due_before === undefined
+    ? undefined
+    : validDate(query.due_before, 'due_before', { nullable: false, endOfDay: true });
+
+  return { status, priority, q: q?.trim() || undefined, page, limit, due_after, due_before };
+}
+
 async function list(req, res) {
-  const { status, priority, q } = req.query;
-  if (status && !statuses.includes(status)) throw new HttpError(400, 'INVALID_STATUS', 'Filter status tidak valid.');
-  if (priority && !priorities.includes(priority)) throw new HttpError(400, 'INVALID_PRIORITY', 'Filter priority tidak valid.');
-  if (q !== undefined && (typeof q !== 'string' || q.length > 100)) throw new HttpError(400, 'INVALID_QUERY', 'q maksimal 100 karakter.');
-  const page = req.query.page === undefined ? 1 : positiveInt(req.query.page, 'page');
-  const limit = req.query.limit === undefined ? 20 : positiveInt(req.query.limit, 'limit');
-  if (limit > 100) throw new HttpError(400, 'INVALID_LIMIT', 'limit maksimal 100.');
-  const filters = {
-    status, priority, q: q?.trim() || undefined, page, limit,
-    due_after: req.query.due_after === undefined ? undefined : validDate(req.query.due_after, 'due_after', false),
-    due_before: req.query.due_before === undefined ? undefined : validDate(req.query.due_before, 'due_before', false),
-  };
-  const { rows, total } = await service.list(filters);
-  res.json({ data: rows, meta: { page, limit, total, total_pages: Math.ceil(total / limit) } });
+  const filters = parseListQuery(req.query);
+  const { rows, total } = await service.list(req.user.id, filters);
+  res.json({
+    data: rows,
+    meta: { page: filters.page, limit: filters.limit, total, total_pages: Math.ceil(total / filters.limit) },
+  });
 }
 
 async function get(req, res) {
-  const task = await service.findById(positiveInt(req.params.id, 'id'));
-  if (!task) throw new HttpError(404, 'TASK_NOT_FOUND', 'Tugas tidak ditemukan.');
+  const task = await service.findById(req.user.id, positiveInt(req.params.id, 'id'));
+  if (!task) throw notFound();
   res.json({ data: task });
 }
 
 async function create(req, res) {
-  const task = await service.create(validateTask(req.body));
+  const task = await service.create(req.user.id, validateTask(req.body));
   res.status(201).json({ data: task });
 }
 
 async function update(req, res) {
-  const changes = validateTask(req.body, true);
-  const task = await service.update(positiveInt(req.params.id, 'id'), changes);
-  if (!task) throw new HttpError(404, 'TASK_NOT_FOUND', 'Tugas tidak ditemukan.');
+  const id = positiveInt(req.params.id, 'id');
+  const task = await service.update(req.user.id, id, validateTask(req.body, true));
+  if (!task) throw notFound();
   res.json({ data: task });
 }
 
 async function updateStatus(req, res) {
-  if (!req.body || !statuses.includes(req.body.status)) throw new HttpError(400, 'INVALID_STATUS', `status harus salah satu: ${statuses.join(', ')}.`);
-  const task = await service.updateStatus(positiveInt(req.params.id, 'id'), req.body.status);
-  if (!task) throw new HttpError(404, 'TASK_NOT_FOUND', 'Tugas tidak ditemukan.');
+  const id = positiveInt(req.params.id, 'id');
+  requireObjectBody(req.body);
+  if (!STATUSES.includes(req.body.status)) {
+    throw new HttpError(400, 'INVALID_STATUS', `status harus salah satu: ${STATUSES.join(', ')}.`);
+  }
+  const task = await service.updateStatus(req.user.id, id, req.body.status);
+  if (!task) throw notFound();
   res.json({ data: task });
 }
 
 async function remove(req, res) {
-  const deleted = await service.remove(positiveInt(req.params.id, 'id'));
-  if (!deleted) throw new HttpError(404, 'TASK_NOT_FOUND', 'Tugas tidak ditemukan.');
+  const deleted = await service.remove(req.user.id, positiveInt(req.params.id, 'id'));
+  if (!deleted) throw notFound();
   res.status(204).end();
 }
 
-module.exports = { list, get, create, update, updateStatus, remove, HttpError };
+module.exports = { list, get, create, update, updateStatus, remove };

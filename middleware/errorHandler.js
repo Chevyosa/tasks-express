@@ -1,18 +1,37 @@
-module.exports = (error, _req, res, _next) => {
-  if (res.headersSent) return;
+const HttpError = require('../utils/httpError');
+const logger = require('../utils/logger');
 
-  if (Number.isInteger(error.status) && error.status >= 400 && error.status < 500) {
-    return res.status(error.status).json({
-      error: { code: error.code || 'REQUEST_ERROR', message: error.message },
-    });
-  }
+function send(res, status, code, message) {
+  return res.status(status).json({ error: { code, message } });
+}
 
+module.exports = (error, req, res, next) => {
+  if (res.headersSent) return next(error);
+
+  // Body-parser errors carry status 400/413/415; handle them before the generic 4xx branch.
   if (error.type === 'entity.parse.failed') {
-    return res.status(400).json({ error: { code: 'INVALID_JSON', message: 'Format JSON tidak valid.' } });
+    return send(res, 400, 'INVALID_JSON', 'Format JSON tidak valid.');
+  }
+  if (error.type === 'entity.too.large') {
+    return send(res, 413, 'PAYLOAD_TOO_LARGE', 'Ukuran body melebihi batas.');
   }
 
-  console.error(error);
-  return res.status(500).json({
-    error: { code: 'INTERNAL_ERROR', message: 'Terjadi kesalahan pada server.' },
+  // Only our own errors expose their message to the client.
+  if (error instanceof HttpError) {
+    return send(res, error.status, error.code, error.message);
+  }
+
+  const status = Number.isInteger(error.status) ? error.status : error.statusCode;
+  if (Number.isInteger(status) && status >= 400 && status < 500) {
+    return send(res, status, 'REQUEST_ERROR', 'Permintaan tidak dapat diproses.');
+  }
+
+  logger.error('request.failed', {
+    method: req.method,
+    path: req.path,
+    name: error.name,
+    code: error.code,
+    message: error.message,
   });
+  return send(res, 500, 'INTERNAL_ERROR', 'Terjadi kesalahan pada server.');
 };

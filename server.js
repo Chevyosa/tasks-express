@@ -1,40 +1,67 @@
 require('dotenv').config();
 
-const app = require('./app');
-const { pool } = require('./config/database');
+const logger = require('./utils/logger');
 
-const port = Number(process.env.PORT || 3000);
+let pool;
+let server;
+let shuttingDown = false;
 
-async function start() {
-  try {
-    await pool.query('SELECT 1');
-    const server = app.listen(port, () => {
-      console.log(`Task API listening on port ${port}`);
-    });
-
-    let shuttingDown = false;
-    const shutdown = (signal) => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      console.log(`${signal} received; shutting down`);
-      server.close(async (error) => {
-        try {
-          await pool.end();
-        } catch (closeError) {
-          console.error('Failed to close database pool');
-          process.exitCode = 1;
-        }
-        if (error) process.exitCode = 1;
-      });
-    };
-
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-  } catch (error) {
-    console.error('Unable to start: check database configuration and availability.');
-    await pool.end().catch(() => {});
-    process.exitCode = 1;
-  }
+function closePool() {
+  return pool ? pool.end().catch(() => logger.error('db.pool_close_failed')) : Promise.resolve();
 }
 
-start();
+function shutdown(reason, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info('server.shutdown', { reason });
+  if (exitCode) process.exitCode = exitCode;
+
+  const finish = () => closePool().then(() => process.exit());
+  if (!server) {
+    finish();
+    return;
+  }
+  server.close((error) => {
+    if (error) process.exitCode = 1;
+    finish();
+  });
+  // Do not hang forever on open keep-alive connections.
+  setTimeout(() => process.exit(), 10000).unref();
+}
+
+async function start() {
+  const port = Number(process.env.PORT || 3000);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('PORT must be an integer between 1 and 65535.');
+  }
+
+  // Loading these validates configuration (DB_* and JWT_*) without printing secret values.
+  require('./config/auth').getAuthConfig();
+  ({ pool } = require('./config/database'));
+  const app = require('./app');
+
+  try {
+    await pool.query('SELECT 1');
+  } catch {
+    throw new Error('Unable to connect to the database: check DB_* settings and that MySQL is running.');
+  }
+
+  server = app.listen(port);
+  server.on('listening', () => logger.info('server.listening', { port }));
+  server.on('error', (error) => {
+    logger.error('server.error', { code: error.code, message: error.code === 'EADDRINUSE' ? `Port ${port} is already in use.` : error.message });
+    shutdown('server_error', 1);
+  });
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('unhandledRejection', (error) => {
+  logger.error('process.unhandled_rejection', { name: error?.name, message: error?.message });
+  shutdown('unhandled_rejection', 1);
+});
+
+start().catch((error) => {
+  logger.error('server.start_failed', { message: error.message });
+  shutdown('start_failed', 1);
+});
